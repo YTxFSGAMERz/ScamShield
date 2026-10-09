@@ -1,0 +1,11 @@
+{
+  "title": "ScamShield: An AI Cyber Defense Tool Designed for My Dadi, Powered by Gemma",
+  "description": "A multimodal fraud defense app built for an older family persona, featuring vision inspection, offline Gemma fallback, and Golden Hour victim recovery.",
+  "tags": [
+    "devchallenge",
+    "weekendchallenge",
+    "hf26challenge",
+    "gemma"
+  ],
+  "main_image": "https://raw.githubusercontent.com/YTxFSGAMERz/hacktoberfest-ScamShield/de8c599ad131fc4dac4c50bc09eedd8ea40050ea/docs/devto-images/cover.png"
+}

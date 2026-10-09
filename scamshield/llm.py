@@ -1,0 +1,447 @@
+"""ScamShield — LLM provider abstraction.
+
+Supports:
+  - Gemini API (primary): gemma-4-e4b-it
+  - Ollama (fallback):    gemma4:e4b
+  - LLM_PROVIDER=auto:   tries Gemini, falls back to Ollama on error
+
+Usage:
+    from scamshield.llm import get_provider, analyze_image
+
+    provider = get_provider()  # returns "gemini", "ollama", or raises
+    result = analyze_image(image_bytes, prompt, system_prompt, provider)
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import logging
+import os
+import re
+
+import requests
+from dotenv import load_dotenv
+from PIL import Image
+import io
+
+load_dotenv()
+
+logger = logging.getLogger(__name__)
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "auto").lower()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemma-4-26b-a4b-it")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma4:e4b")
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "")
+
+
+class LLMError(Exception):
+    """Raised when all LLM providers fail."""
+
+
+# ── Provider detection & configuration helpers ─────────────────────────────────
+
+def _get_ollama_base_url() -> str:
+    """Return effective Ollama base URL (local daemon or Ollama Cloud)."""
+    url = os.getenv("OLLAMA_BASE_URL", "").strip()
+    if not url:
+        if os.getenv("VERCEL") or os.getenv("OLLAMA_API_KEY"):
+            return "https://ollama.com"
+        return os.getenv("OLLAMA_BASE_URL", OLLAMA_BASE_URL)
+    return url.rstrip("/")
+
+
+def _get_ollama_headers() -> dict:
+    """Construct HTTP headers for Ollama API requests (supports Ollama Cloud auth)."""
+    headers = {"Content-Type": "application/json"}
+    api_key = os.getenv("OLLAMA_API_KEY", OLLAMA_API_KEY).strip()
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
+
+
+def _gemini_available() -> bool:
+    """Check if Gemini API key is configured."""
+    key = os.getenv("GEMINI_API_KEY", GEMINI_API_KEY)
+    return bool(key and key != "your_gemini_api_key_here")
+
+
+def _ollama_available() -> bool:
+    """Check if Ollama (local daemon or Ollama Cloud endpoint) is accessible."""
+    base_url = _get_ollama_base_url()
+    headers = _get_ollama_headers()
+    api_key = os.getenv("OLLAMA_API_KEY", OLLAMA_API_KEY).strip()
+
+    # If Ollama Cloud API key is configured with cloud URL, consider ready
+    if api_key and ("ollama.com" in base_url or base_url.startswith("https://")):
+        return True
+
+    try:
+        r = requests.get(f"{base_url}/api/tags", headers=headers, timeout=3)
+        if r.status_code == 200:
+            models = [m.get("name", "") for m in r.json().get("models", [])]
+            return any("gemma" in m.lower() for m in models)
+        return False
+    except Exception:
+        return False
+
+
+def get_provider() -> str:
+    """Determine which LLM provider to use.
+
+    Returns: "gemini" | "ollama"
+    Raises: LLMError if no provider is available.
+    """
+    pref = os.getenv("LLM_PROVIDER", LLM_PROVIDER).lower()
+    if pref == "gemini":
+        if _gemini_available():
+            return "gemini"
+        if _ollama_available():
+            logger.warning("Gemini requested but not available; automatically falling back to Ollama.")
+            return "ollama"
+        raise LLMError("Gemini API key not configured. Set GEMINI_API_KEY in .env")
+
+    if pref == "ollama":
+        if _ollama_available():
+            return "ollama"
+        raise LLMError(
+            f"Ollama not available or {os.getenv('OLLAMA_MODEL', OLLAMA_MODEL)} not installed. "
+            "Configure local Ollama or set OLLAMA_BASE_URL / OLLAMA_API_KEY for Ollama Cloud."
+        )
+
+    # auto mode: try Gemini first, then Ollama
+    if _gemini_available():
+        return "gemini"
+    if _ollama_available():
+        logger.info("Gemini API not configured; using Ollama.")
+        return "ollama"
+
+    raise LLMError(
+        "No AI provider available. Configure GEMINI_API_KEY or OLLAMA_API_KEY / OLLAMA_BASE_URL."
+    )
+
+
+def get_provider_status() -> dict:
+    """Return dictionary of current provider availability and config."""
+    gemini_ok = _gemini_available()
+    ollama_ok = _ollama_available()
+    base_url = _get_ollama_base_url()
+    is_cloud = bool(os.getenv("OLLAMA_API_KEY") or "ollama.com" in base_url)
+    try:
+        active = get_provider()
+    except Exception:
+        active = "auto"
+    return {
+        "active_provider": active,
+        "gemini_available": gemini_ok,
+        "ollama_available": ollama_ok,
+        "ollama_cloud_ready": is_cloud,
+        "gemini_model": os.getenv("GEMINI_MODEL", GEMINI_MODEL),
+        "ollama_model": os.getenv("OLLAMA_MODEL", OLLAMA_MODEL),
+        "ollama_base_url": base_url,
+        "auto_fallback_enabled": True,
+    }
+
+
+# ── Image preprocessing ────────────────────────────────────────────────────────
+
+def _prepare_image(image_bytes: bytes, max_size: tuple[int, int] = (1024, 1024)) -> bytes:
+    """Resize image if too large, convert to JPEG for API efficiency."""
+    img = Image.open(io.BytesIO(image_bytes))
+    img = img.convert("RGB")
+    img.thumbnail(max_size, Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85)
+    return buf.getvalue()
+
+
+# ── Gemini API ─────────────────────────────────────────────────────────────────
+
+def _call_gemini(image_bytes: bytes, user_prompt: str, system_prompt: str) -> str:
+    """Call Gemini API with vision support using REST."""
+    processed = _prepare_image(image_bytes)
+    b64_image = base64.b64encode(processed).decode("utf-8")
+
+    payload = {
+        "system_instruction": {
+            "parts": [{"text": system_prompt}]
+        },
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    {
+                        "inline_data": {
+                            "mime_type": "image/jpeg",
+                            "data": b64_image,
+                        }
+                    },
+                    {"text": user_prompt},
+                ],
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.1,
+            "maxOutputTokens": 2048,
+        },
+    }
+
+    api_key = os.getenv("GEMINI_API_KEY", GEMINI_API_KEY)
+    model = os.getenv("GEMINI_MODEL", GEMINI_MODEL)
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+
+    response = requests.post(url, json=payload, timeout=60)
+    response.raise_for_status()
+
+    data = response.json()
+    candidates = data.get("candidates", [])
+    if not candidates:
+        raise LLMError(f"Gemini returned no candidates: {data}")
+
+    parts = candidates[0].get("content", {}).get("parts", [])
+    # Separate thoughts from answer text (Gemma 4 has native thought tokens)
+    thought_parts = [p.get("text", "") for p in parts if p.get("thought", False)]
+    answer_parts = [p.get("text", "") for p in parts if not p.get("thought", False)]
+
+    text = "".join(answer_parts) if answer_parts else (parts[-1].get("text", "") if parts else "")
+    reasoning = "\n\n".join(thought_parts).strip()
+    return text, reasoning
+
+
+# ── Ollama API ─────────────────────────────────────────────────────────────────
+
+def _call_ollama(image_bytes: bytes, user_prompt: str, system_prompt: str) -> str:
+    """Call Ollama API (local daemon or Ollama Cloud) with vision support."""
+    processed = _prepare_image(image_bytes)
+    b64_image = base64.b64encode(processed).decode("utf-8")
+    model = os.getenv("OLLAMA_MODEL", OLLAMA_MODEL)
+    base_url = _get_ollama_base_url()
+    headers = _get_ollama_headers()
+
+    payload = {
+        "model": model,
+        "prompt": user_prompt,
+        "system": system_prompt,
+        "images": [b64_image],
+        "stream": False,
+        "format": "json",
+        "options": {
+            "temperature": 0.1,
+            "num_predict": 1024,
+        },
+    }
+
+    response = requests.post(
+        f"{base_url}/api/generate",
+        headers=headers,
+        json=payload,
+        timeout=120,
+    )
+    response.raise_for_status()
+
+    data = response.json()
+    return data.get("response", "")
+
+
+# ── JSON extraction ────────────────────────────────────────────────────────────
+
+def _extract_json(text: str) -> dict:
+    """Extract and parse JSON from LLM response text."""
+    # Try direct parse first
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Try to find JSON block in markdown fences
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if fenced:
+        try:
+            return json.loads(fenced.group(1))
+        except json.JSONDecodeError:
+            pass
+
+    # Try to extract bare JSON object
+    obj_match = re.search(r"\{.*\}", text, re.DOTALL)
+    if obj_match:
+        try:
+            return json.loads(obj_match.group(0))
+        except json.JSONDecodeError:
+            pass
+
+    # Return a safe fallback
+    logger.warning("Could not parse JSON from LLM response: %s", text[:200])
+    return {
+        "verdict": "SUSPICIOUS",
+        "risk_score": 50,
+        "confidence": "LOW",
+        "scam_type": "Unknown",
+        "summary": "Analysis could not be parsed. Treat with caution.",
+        "red_flags": ["AI response parsing error — manual review recommended"],
+        "advice": "Show this to someone you trust for a second opinion.",
+    }
+
+
+# ── Main entry point ───────────────────────────────────────────────────────────
+
+def analyze_image(
+    image_bytes: bytes,
+    user_prompt: str,
+    system_prompt: str,
+    provider: str | None = None,
+) -> tuple[dict, str]:
+    """Analyze an image for scams with automatic failover between Gemini and Ollama Cloud.
+
+    Args:
+        image_bytes: Raw image bytes.
+        user_prompt: The analysis prompt.
+        system_prompt: The system/role prompt.
+        provider: "gemini" | "ollama" | None (auto-detect).
+
+    Returns:
+        (result_dict, provider_used)
+
+    Raises:
+        LLMError: If all providers fail.
+    """
+    if provider is None:
+        try:
+            provider = get_provider()
+        except Exception:
+            provider = "auto"
+
+    errors = []
+
+    # 1. Primary: Try Gemini API if requested or in auto mode
+    if provider in ("gemini", "auto") and _gemini_available():
+        try:
+            raw_text, reasoning = _call_gemini(image_bytes, user_prompt, system_prompt)
+            data = _extract_json(raw_text)
+            if reasoning and not data.get("reasoning"):
+                data["reasoning"] = reasoning
+            return data, "gemini"
+        except Exception as e:
+            logger.warning("Gemini API call failed (%s). Triggering automatic failover to Ollama Cloud / local...", e)
+            errors.append(f"Gemini: {e}")
+
+    # 2. Failover: Try Ollama (Local daemon or Ollama Cloud endpoint)
+    if _ollama_available() or os.getenv("OLLAMA_API_KEY") or os.getenv("OLLAMA_BASE_URL") or provider == "ollama":
+        try:
+            logger.info("Executing automatic failover to Ollama Gemma 4...")
+            raw_text = _call_ollama(image_bytes, user_prompt, system_prompt)
+            data = _extract_json(raw_text)
+            return data, "ollama"
+        except Exception as e:
+            logger.warning("Ollama call failed: %s", e)
+            errors.append(f"Ollama: {e}")
+
+    # If all options exhausted
+    error_summary = " | ".join(errors) if errors else "No AI provider configured"
+    raise LLMError(f"ScamShield analysis failed across all AI providers: {error_summary}")
+
+
+def analyze_text(
+    text: str,
+    user_prompt: str,
+    system_prompt: str,
+    provider: str | None = None,
+) -> tuple[dict, str]:
+    """Analyze raw text (SMS/WhatsApp message) for scams using Gemini text mode.
+
+    Args:
+        text: The raw message text to analyze.
+        user_prompt: The analysis prompt (will have text injected).
+        system_prompt: The system/role prompt.
+        provider: "gemini" | "ollama" | None (auto-detect).
+
+    Returns:
+        (result_dict, provider_used)
+
+    Raises:
+        LLMError: If all providers fail.
+    """
+    if provider is None:
+        try:
+            provider = get_provider()
+        except Exception:
+            provider = "auto"
+
+    errors = []
+
+    # 1. Primary: Try Gemini API (text-only mode)
+    if provider in ("gemini", "auto") and _gemini_available():
+        try:
+            api_key = os.getenv("GEMINI_API_KEY", GEMINI_API_KEY)
+            model = os.getenv("GEMINI_MODEL", GEMINI_MODEL)
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+
+            payload = {
+                "system_instruction": {
+                    "parts": [{"text": system_prompt}]
+                },
+                "contents": [
+                    {
+                        "role": "user",
+                        "parts": [{"text": f"{user_prompt}\n\n--- MESSAGE TO ANALYZE ---\n{text}\n--- END MESSAGE ---"}],
+                    }
+                ],
+                "generationConfig": {
+                    "temperature": 0.1,
+                    "maxOutputTokens": 2048,
+                },
+            }
+
+            response = requests.post(url, json=payload, timeout=60)
+            response.raise_for_status()
+            data_json = response.json()
+            candidates = data_json.get("candidates", [])
+            if not candidates:
+                raise LLMError(f"Gemini text returned no candidates: {data_json}")
+
+            parts = candidates[0].get("content", {}).get("parts", [])
+            thought_parts = [p.get("text", "") for p in parts if p.get("thought", False)]
+            answer_parts = [p.get("text", "") for p in parts if not p.get("thought", False)]
+            raw_text = "".join(answer_parts) if answer_parts else (parts[-1].get("text", "") if parts else "")
+            reasoning = "\n\n".join(thought_parts).strip()
+
+            result = _extract_json(raw_text)
+            if reasoning and not result.get("reasoning"):
+                result["reasoning"] = reasoning
+            return result, "gemini"
+        except Exception as e:
+            logger.warning("Gemini text analysis failed (%s). Triggering automatic failover...", e)
+            errors.append(f"Gemini: {e}")
+
+    # 2. Failover: Try Ollama (text mode)
+    if _ollama_available() or os.getenv("OLLAMA_API_KEY") or provider == "ollama":
+        try:
+            model = os.getenv("OLLAMA_MODEL", OLLAMA_MODEL)
+            base_url = _get_ollama_base_url()
+            headers = _get_ollama_headers()
+
+            ollama_messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"{user_prompt}\n\n--- MESSAGE TO ANALYZE ---\n{text}\n--- END MESSAGE ---"},
+            ]
+            payload = {
+                "model": model,
+                "messages": ollama_messages,
+                "stream": False,
+                "format": "json",
+                "options": {"temperature": 0.1, "num_predict": 1024},
+            }
+            response = requests.post(f"{base_url}/api/chat", headers=headers, json=payload, timeout=90)
+            response.raise_for_status()
+            raw_text = response.json().get("message", {}).get("content", "")
+            result = _extract_json(raw_text)
+            return result, "ollama"
+        except Exception as e:
+            logger.warning("Ollama text analysis failed: %s", e)
+            errors.append(f"Ollama: {e}")
+
+    error_summary = " | ".join(errors) if errors else "No AI provider configured"
+    raise LLMError(f"Text analysis failed across all AI providers: {error_summary}")
